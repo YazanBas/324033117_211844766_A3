@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-import os
+import json
 import random
 import shutil
 from pathlib import Path
@@ -86,6 +86,43 @@ def copy_folder_mode(dataset_root: Path, out_root: Path, name: str, synset: str,
 
     return len(chosen)
 
+def load_split(root: Path, split: str) -> list | None:
+    path = root / f"{split}_split.json"
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+def copy_split_entry(dataset_root: Path, out_root: Path, entry: list) -> None:
+    _, _, point_path, seg_path = entry
+    src_points = dataset_root / point_path
+    dst_points = out_root / point_path
+    dst_points.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_points, dst_points)
+
+    src_seg = dataset_root / seg_path
+    dst_seg = out_root / seg_path
+    dst_seg.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_seg, dst_seg)
+
+def proportional_counts(per_split: dict, total: int) -> dict:
+    counts = {}
+    fracs = []
+    total_available = sum(len(v) for v in per_split.values())
+    if total_available == 0:
+        return {k: 0 for k in per_split}
+    for split, items in per_split.items():
+        raw = len(items) / total_available * total
+        counts[split] = int(raw)
+        fracs.append((raw - counts[split], split))
+    remaining = total - sum(counts.values())
+    for _, split in sorted(fracs, reverse=True):
+        if remaining <= 0:
+            break
+        counts[split] += 1
+        remaining -= 1
+    return counts
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a CPU-friendly ShapeNet subset.")
     parser.add_argument("--data-root", default="shapenet-core-seg", help="Path to ShapeNet dataset root")
@@ -118,19 +155,56 @@ def main() -> None:
 
     rng = random.Random(args.seed)
 
-    points_mode = (dataset_root / "points").is_dir() and (dataset_root / "points_label").is_dir()
+    splits = {split: load_split(dataset_root, split) for split in ("train", "val", "test")}
 
     summary = []
-    for name in args.categories:
-        synset = mapping.get(name.lower())
-        if not synset:
-            raise KeyError(f"Category '{name}' not found in synsetoffset2category.txt")
+    if all(splits.values()):
+        split_outputs = {"train": [], "val": [], "test": []}
+        class_map = {name: idx for idx, name in enumerate(args.categories)}
 
-        if points_mode:
-            count = copy_points_mode(dataset_root, out_root, name, synset, args.samples_per_class, rng)
-        else:
-            count = copy_folder_mode(dataset_root, out_root, name, synset, args.samples_per_class, rng)
-        summary.append((name, synset, count))
+        for name in args.categories:
+            synset = mapping.get(name.lower())
+            if not synset:
+                raise KeyError(f"Category '{name}' not found in synsetoffset2category.txt")
+
+            per_split = {}
+            for split, data in splits.items():
+                per_split[split] = [e for e in data if e[1] == name]
+
+            total_pick = min(args.samples_per_class, sum(len(v) for v in per_split.values()))
+            counts = proportional_counts(per_split, total_pick)
+
+            chosen_total = 0
+            for split, items in per_split.items():
+                pick = counts[split]
+                if pick == 0:
+                    continue
+                selected = rng.sample(items, pick) if len(items) > pick else items
+                for entry in selected:
+                    entry = list(entry)
+                    entry[0] = class_map[name]
+                    entry[1] = name
+                    split_outputs[split].append(entry)
+                    copy_split_entry(dataset_root, out_root, entry)
+                chosen_total += len(selected)
+
+            summary.append((name, synset, chosen_total))
+
+        for split, data in split_outputs.items():
+            with (out_root / f"{split}_split.json").open("w", encoding="utf-8") as f:
+                json.dump(data, f)
+    else:
+        points_mode = (dataset_root / "points").is_dir() and (dataset_root / "points_label").is_dir()
+        for name in args.categories:
+            synset = mapping.get(name.lower())
+            if not synset:
+                raise KeyError(f"Category '{name}' not found in synsetoffset2category.txt")
+
+            if points_mode:
+                count = copy_points_mode(dataset_root, out_root, name, synset, args.samples_per_class, rng)
+            else:
+                count = copy_folder_mode(dataset_root, out_root, name, synset, args.samples_per_class, rng)
+            summary.append((name, synset, count))
 
     print("Subset summary:")
     print("Category\tSynset\tSamples")
